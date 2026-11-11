@@ -1,6 +1,26 @@
 # Methods and equations
 
-SONOSCOPE is designed to make the classical baseline visible and inspectable. The implementation uses NumPy/SciPy primitives rather than a high-level speech-analysis package.
+SpeakReady exposes its practice metrics and keeps the original speech laboratory's NumPy/SciPy reference implementations available in `sonoscope/dsp/` and `sonoscope/recognizers/`.
+
+## Speaking practice
+
+The recording is split into 25 ms frames with 10 ms hops. An RMS-energy threshold relative to the signal peak approximates active speech. Short gaps are joined to reduce fragmented detections. If the user supplies a transcript, pace is estimated as whitespace-delimited tokens divided by estimated active time. The metric is a rough practice aid; it is not transcription or linguistic analysis.
+
+Pitch is estimated via autocorrelation on selected active frames. Only positive periodicity estimates are shown. The middle-half pitch range is expressed in semitones:
+
+\[
+R_{\mathrm{pitch}}=12\log_2\left(\frac{Q_{0.75}(F_0)}{Q_{0.25}(F_0)}\right).
+\]
+
+## Soft-knee compressor
+
+The RMS detector uses separate one-pole attack and release smoothing. Let \(L\) be the detector level in dBFS, \(T\) the threshold, \(R\) the ratio, and \(K\) the knee width. Above the soft knee, the compressed level is \(T+(L-T)/R\). Within the knee:
+
+\[
+L_{\mathrm{out}}=L+\left(\frac{1}{R}-1\right)\frac{(L-T+K/2)^2}{2K}.
+\]
+
+The difference between compressed and input level sets the sample gain. This is a feed-forward dynamics compressor, not a brick-wall limiter or denoiser.
 
 ## Feature extraction
 

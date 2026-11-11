@@ -1,4 +1,4 @@
-"""SONOSCOPE speech-processing backend."""
+"""SpeakReady speech-processing package and SONOSCOPE DSP experiments."""
 
 from .dsp.audio import load_audio, resample_audio, to_mono
 from .dsp.features import extract_features, mfcc

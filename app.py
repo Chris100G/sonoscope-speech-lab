@@ -1,55 +1,33 @@
-"""SONOSCOPE: a local-first, interactive speech-processing laboratory."""
+"""SpeakReady: a practical, private speaking-practice and audio-toolkit app."""
 
 from __future__ import annotations
 
-import importlib.util
-import tempfile
-import time
-from pathlib import Path
+import hashlib
+import io
+import json
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import soundfile as sf
 import streamlit as st
 
-from sonoscope.assistant import (
-    build_demo_recognizer,
-    demo_commands,
-    fuse_scores,
-    recognize_with_fusion,
-    synthesize_command,
-)
+from sonoscope.coach import analyze_speech, compress_audio
 from sonoscope.dsp.audio import load_audio
-from sonoscope.dsp.distances import (
-    cepstral_distance,
-    cosine_distance,
-    dtw,
-    euclidean_distance,
-    itakura_distance,
-)
-from sonoscope.dsp.features import (
-    delta,
-    frame_signal,
-    mel_filterbank,
-    mfcc,
-    pre_emphasis,
-    window_frames,
-)
-from sonoscope.dsp.hmm import DiscreteHMM, baum_welch
-from sonoscope.dsp.speech import estimate_pitch, formants, lpc, lpc_resynthesis, vad
-from sonoscope.recognizers import DTWTemplateRecognizer, VQHMMRecognizer
-from sonoscope.ui.profile_io import export_profile, import_profile
 from sonoscope.ui.style import apply_styles
 
 SAMPLE_RATE = 16_000
-COMMANDS = demo_commands()
-COMMAND_BY_KEY = {command.key: command for command in COMMANDS}
-_chart_counter = 0
-
+TARGETS = {
+    "Steady conversation": (110, 160),
+    "Interview answer": (115, 165),
+    "Presentation": (105, 155),
+    "My own range": None,
+}
 
 st.set_page_config(
-    page_title="SONOSCOPE | Speech Laboratory",
+    page_title="SpeakReady | Speaking practice",
     page_icon="◉",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -57,718 +35,529 @@ st.set_page_config(
 apply_styles()
 
 
-@st.cache_resource
-def demo_model() -> DTWTemplateRecognizer:
-    """Cache the tiny, deterministic demo model for this app process."""
-    return build_demo_recognizer(SAMPLE_RATE)
+def chart(figure: go.Figure, key: str) -> None:
+    """Render a responsive chart with an explicit unique element key."""
+    st.plotly_chart(figure, width="stretch", key=key)
 
 
-def audio_input(key: str, *, demo: bool = True) -> tuple[np.ndarray, int, str]:
-    """Render upload/microphone controls and return audio standardized to 16 kHz."""
-    uploaded = st.file_uploader(
-        "Upload audio (WAV, FLAC, or supported MP3)",
-        type=["wav", "flac", "mp3"],
-        key=f"{key}-upload",
-    )
-    microphone = st.audio_input("Or record a short clip", key=f"{key}-mic")
-    source = uploaded if uploaded is not None else microphone
-    if source is not None:
-        audio, rate = load_audio(source.getvalue(), target_sr=SAMPLE_RATE)
-        if audio.size == 0:
-            raise ValueError("The selected audio contains no samples.")
-        return audio, rate, "recording" if microphone is source else "upload"
-    if demo:
-        selection = st.selectbox(
-            "Synthetic demo pattern",
-            COMMANDS,
-            format_func=lambda command: f"{command.text} · {command.language.upper()}",
-            key=f"{key}-demo",
-        )
-        return synthesize_command(selection), SAMPLE_RATE, "synthetic demo"
-    return np.empty(0, dtype=np.float64), SAMPLE_RATE, "no audio"
-
-
-def waveform_figure(signal: np.ndarray, sample_rate: int, title: str) -> go.Figure:
-    """Build a bounded waveform plot for responsive rendering."""
+def wave_chart(signal: np.ndarray, sample_rate: int, title: str, key: str) -> go.Figure:
     step = max(1, len(signal) // 12_000)
-    times = np.arange(0, len(signal), step) / sample_rate
     figure = go.Figure(
         go.Scattergl(
-            x=times,
+            x=np.arange(0, len(signal), step) / sample_rate,
             y=signal[::step],
             mode="lines",
-            name="waveform",
-            line={"color": "#167c80", "width": 1.4},
+            line={"color": "#167c80", "width": 1.25},
             fill="tozeroy",
-            fillcolor="rgba(22,124,128,.10)",
+            fillcolor="rgba(22,124,128,.1)",
+            name="audio",
         )
     )
     figure.update_layout(
-        title={"text": title, "x": 0.025, "xanchor": "left"},
-        xaxis_title="Time (s)",
+        title={"text": title, "x": 0.02},
+        xaxis_title="Time (seconds)",
         yaxis_title="Amplitude",
         height=300,
         margin={"l": 25, "r": 15, "t": 55, "b": 35},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
     )
-    figure.update_xaxes(showgrid=True, gridcolor="rgba(24,62,68,.08)", zeroline=False)
-    figure.update_yaxes(showgrid=True, gridcolor="rgba(24,62,68,.08)", zeroline=False)
+    figure.update_xaxes(showgrid=True, gridcolor="rgba(24,62,68,.08)")
+    figure.update_yaxes(showgrid=True, gridcolor="rgba(24,62,68,.08)")
     return figure
 
 
-def feature_heatmap(features: np.ndarray, title: str) -> go.Figure:
-    figure = go.Figure(
-        go.Heatmap(z=features.T, colorscale="Tealgrn", colorbar_title="Value")
+def audio_controls(prefix: str) -> tuple[np.ndarray, int] | None:
+    """Offer browser recording or audio upload and normalize to mono 16 kHz."""
+    upload, microphone = st.columns(2)
+    with upload:
+        uploaded = st.file_uploader(
+            "Choose WAV, FLAC, or MP3",
+            type=["wav", "flac", "mp3"],
+            key=f"{prefix}-upload",
+            help="A 15–60 second clip is a useful practice length.",
+        )
+    with microphone:
+        recording = st.audio_input("Record a practice take", key=f"{prefix}-mic")
+    source = recording if recording is not None else uploaded
+    if source is None:
+        return None
+    try:
+        audio, rate = load_audio(source.getvalue(), target_sr=SAMPLE_RATE)
+    except (ValueError, RuntimeError, sf.SoundFileRuntimeError) as error:
+        st.error(f"Could not read that audio file: {error}")
+        return None
+    if not audio.size:
+        st.error("This audio contains no samples.")
+        return None
+    if len(audio) / rate > 90:
+        st.error("For a quick, responsive analysis, please choose a clip under 90 seconds.")
+        return None
+    st.caption(
+        f"{'Microphone recording' if recording is not None else 'Uploaded audio'} "
+        f"· {len(audio) / rate:.1f} s · {rate:,} Hz · mono"
     )
-    figure.update_layout(
-        title=title,
-        xaxis_title="Frame",
-        yaxis_title="Coefficient",
-        height=320,
-        margin={"l": 20, "r": 20, "t": 55, "b": 35},
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-    )
-    return figure
+    return audio, rate
 
 
-def demo_spectrogram_figure(signal: np.ndarray, features: np.ndarray) -> go.Figure:
-    """Create a compact time/frequency/cepstral overview of a demo signal."""
-    frames = window_frames(frame_signal(signal, 400, 160))
-    spectrum = np.abs(np.fft.rfft(frames, n=512, axis=1)) ** 2
-    frequencies = np.fft.rfftfreq(512, 1 / SAMPLE_RATE)
+def pace_guidance(wpm: float | None, target: tuple[int, int]) -> tuple[str, str]:
+    if wpm is None:
+        return "Add your words", "Paste an edited transcript above to estimate speaking pace."
+    low, high = target
+    if wpm > high:
+        return "Try a little more space", "Pause at commas and full stops. Keep the words that carry your point."
+    if wpm < low:
+        return "Try joining a phrase", "If the pauses felt unplanned, rehearse one sentence as a single thought."
+    return "Your pace is in your chosen range", "Keep this take as a reference, then compare how a second take feels."
+
+
+def timeline_chart(report: dict[str, object]) -> go.Figure:
+    times = np.asarray(report["frame_times"])
+    levels = np.asarray(report["frame_levels_dbfs"])
+    speech = np.asarray(report["speech_mask"], dtype=bool)
     figure = go.Figure()
     figure.add_trace(
-        go.Heatmap(
-            z=10 * np.log10(np.maximum(spectrum[:, :97].T, 1e-12)),
-            x=np.arange(len(frames)) * 0.01,
-            y=frequencies[:97],
-            colorscale="Viridis",
-            colorbar={"title": "dB", "x": 1.0, "len": 0.42, "y": 0.77},
-            xaxis="x",
-            yaxis="y",
-            name="Short-time spectrum",
+        go.Scatter(
+            x=times,
+            y=levels,
+            mode="lines",
+            line={"color": "#809497", "width": 1},
+            name="Frame level",
         )
     )
     figure.add_trace(
-        go.Heatmap(
-            z=features.T,
-            x=np.arange(len(features)) * 0.01,
-            colorscale="Teal",
-            colorbar={"title": "MFCC", "x": 1.0, "len": 0.42, "y": 0.23},
-            xaxis="x2",
-            yaxis="y2",
-            name="MFCC",
+        go.Scatter(
+            x=times[speech],
+            y=levels[speech],
+            mode="markers",
+            marker={"color": "#167c80", "size": 4},
+            name="Detected speech frames",
         )
     )
     figure.update_layout(
-        title={"text": "A command, seen two ways", "x": 0.03, "xanchor": "left"},
-        height=490,
-        margin={"l": 22, "r": 68, "t": 58, "b": 30},
+        title={"text": "Speaking rhythm · detected speech and pauses", "x": .02},
+        xaxis_title="Time (seconds)",
+        yaxis_title="RMS level (dBFS)",
+        height=340,
+        margin={"l": 25, "r": 20, "t": 55, "b": 35},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        xaxis={"domain": [0, 0.94], "title": "Time (s)", "anchor": "y"},
-        yaxis={"domain": [0.54, 1], "title": "Frequency (Hz)", "anchor": "x"},
-        xaxis2={"domain": [0, 0.94], "title": "Time (s)", "anchor": "y2"},
-        yaxis2={"domain": [0, 0.46], "title": "Cepstral coefficient", "anchor": "x2"},
-        showlegend=False,
+        legend={"orientation": "h", "y": 1.12},
     )
     return figure
 
 
-def show_chart(figure: go.Figure, *, key: str | None = None) -> None:
-    """Render a Plotly chart with a unique, stable element identity."""
-    global _chart_counter
-    _chart_counter += 1
-    st.plotly_chart(figure, width="stretch", key=key or f"sonoscope-chart-{_chart_counter}")
+def pitch_chart(report: dict[str, object]) -> go.Figure:
+    pitches = np.asarray(
+        [np.nan if value is None else value for value in report["pitch_values_hz"]],
+        dtype=float,
+    )
+    figure = go.Figure(
+        go.Scatter(
+            x=report["pitch_times"],
+            y=pitches,
+            mode="lines+markers",
+            connectgaps=False,
+            marker={"size": 4, "color": "#cf8d48"},
+            line={"color": "#cf8d48", "width": 1.5},
+            name="Estimated pitch",
+        )
+    )
+    figure.update_layout(
+        title={"text": "Pitch movement · voiced frames only", "x": .02},
+        xaxis_title="Time (seconds)",
+        yaxis_title="Estimated pitch (Hz)",
+        height=300,
+        margin={"l": 25, "r": 20, "t": 55, "b": 35},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return figure
 
 
-def spectral_frames(signal: np.ndarray) -> np.ndarray:
-    frames = window_frames(frame_signal(signal, 400, 160))
-    if frames.size == 0:
-        return np.empty((0, 201))
-    return np.abs(np.fft.rfft(frames, n=400, axis=1)) ** 2
+def render_practice() -> None:
+    st.markdown('<div class="sono-section-label">Your next take, made more useful</div>', unsafe_allow_html=True)
+    st.header("Practice a short answer")
+    st.write("Record or upload a take, add your own transcript, and get a few concrete things to try next.")
+    prompts = {
+        "Interview · tell me about a challenge you solved": "Tell me about a challenge you solved and what you learned.",
+        "Meeting · give a concise project update": "What is the current status, and what is one next step?",
+        "Presentation · explain one idea simply": "What is one idea you want your audience to remember?",
+        "Everyday · make a clear request": "What would help you, and why?",
+    }
+    prompt_name = st.selectbox("Choose a real-world rehearsal prompt", list(prompts), key="practice-prompt")
+    st.markdown(f"**Try this:** {prompts[prompt_name]}")
+    source = audio_controls("practice")
+    if source is None:
+        st.info("Start with a short answer to a meeting, interview, or presentation question. Your audio is analysed in memory, not saved in your practice history.")
+        return
+    audio, sample_rate = source
+    st.audio(audio, sample_rate=sample_rate)
+    st.plotly_chart(
+        wave_chart(audio, sample_rate, "Your recording", "practice-waveform"),
+        width="stretch",
+        key="practice-wave",
+    )
+    transcript = st.text_area(
+        "Your transcript (optional)",
+        placeholder="Paste what you said. This helps estimate words per minute; it is not sent to a transcription service.",
+        height=100,
+        key="practice-transcript",
+    )
+    target_name = st.selectbox("Choose a pace reference", list(TARGETS), key="practice-target")
+    if target_name == "My own range":
+        low_col, high_col = st.columns(2)
+        with low_col:
+            low = st.number_input("Comfortable minimum (words/min)", 40, 260, 110, 5)
+        with high_col:
+            high = st.number_input("Comfortable maximum (words/min)", 50, 300, 160, 5)
+        target = (int(low), int(high))
+    else:
+        target = TARGETS[target_name]
+        assert target is not None
+        st.caption(
+            f"Reference only: {target[0]}–{target[1]} words/min. "
+            "Comfortable pace varies by language, setting and speaking style."
+        )
+    if target[0] >= target[1]:
+        st.error("Choose a maximum pace greater than the minimum.")
+        return
+    audio_digest = hashlib.sha256(audio.tobytes()).hexdigest()
+    if st.button("Review this take", type="primary"):
+        try:
+            report = analyze_speech(audio, sample_rate, transcript)
+        except ValueError as error:
+            st.error(f"Could not analyse this take: {error}")
+        else:
+            st.session_state["speakready_report"] = report.to_dict()
+            st.session_state["speakready_target"] = target
+            st.session_state["speakready_transcript"] = transcript
+            st.session_state["speakready_audio_digest"] = audio_digest
+    report = st.session_state.get("speakready_report")
+    if (
+        report is not None
+        and (
+            st.session_state.get("speakready_audio_digest") != audio_digest
+            or st.session_state.get("speakready_transcript") != transcript
+            or st.session_state.get("speakready_target") != target
+        )
+    ):
+        report = None
+    if not report:
+        st.caption("A transcript is optional. Without one, rhythm, pauses, pitch and recording level are still measured.")
+        return
+    target = st.session_state.get("speakready_target", target)
+    title, tip = pace_guidance(report["words_per_minute"], target)
+    st.divider()
+    st.markdown('<div class="sono-section-label">Your practice notes</div>', unsafe_allow_html=True)
+    st.subheader(title)
+    st.write(tip)
+    metric_cols = st.columns(4)
+    metric_cols[0].metric(
+        "Speaking pace",
+        f"{report['words_per_minute']:.0f} wpm" if report["words_per_minute"] is not None else "Add transcript",
+    )
+    metric_cols[1].metric("Speaking time", f"{report['speaking_seconds']:.1f} s")
+    metric_cols[2].metric("Detected pauses", str(report["pause_count"]))
+    metric_cols[3].metric("Long pauses", str(report["long_pause_count"]))
+    chart(timeline_chart(report), "practice-timeline")
+    chart(pitch_chart(report), "practice-pitch")
+    details, other = st.columns(2)
+    with details:
+        st.markdown('<div class="sono-section-label">Signal, not a score</div>', unsafe_allow_html=True)
+        pitch_value = (
+            f"{report['median_pitch_hz']:.0f} Hz median"
+            if report["median_pitch_hz"] is not None
+            else "Not enough voiced frames"
+        )
+        variation = (
+            f"{report['pitch_range_semitones']:.1f} semitones (middle half of voiced frames)"
+            if report["pitch_range_semitones"] is not None
+            else "Not enough voiced frames"
+        )
+        st.markdown(
+            f"- Pitch: **{pitch_value}**\n"
+            f"- Pitch variation: **{variation}**\n"
+            f"- Average voiced level: **{report['average_level_dbfs']:.1f} dBFS**\n"
+            f"- Peak / clipped samples: **{report['peak_level_dbfs']:.1f} dBFS / {report['clipped_percent']:.2f}%**"
+        )
+    with other:
+        st.markdown('<div class="sono-section-label">One small next step</div>', unsafe_allow_html=True)
+        if report["long_pause_count"]:
+            st.markdown(
+                f"You had **{report['long_pause_count']} longer pause(s)**. Try using one intentional breath between your main points."
+            )
+        elif report["pause_count"] == 0:
+            st.markdown("No longer internal pauses were detected. Try adding a breath at one natural transition.")
+        else:
+            st.markdown(
+                f"You have **{report['pause_count']} natural pause(s)**. Keep the one that gives your main point room."
+            )
+        if report["clipped_percent"] > 0.1:
+            st.warning("Some audio peaks are clipped. Move the microphone slightly farther away or lower its input level.")
+        st.caption("Recording level depends on the device and distance; compare takes made with the same setup.")
+    if st.button("Save these notes to this session's history"):
+        history = st.session_state.setdefault("speakready_history", [])
+        history.append(
+            {
+                "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "duration_seconds": report["duration_seconds"],
+                "speaking_seconds": report["speaking_seconds"],
+                "word_count": report["word_count"],
+                "words_per_minute": report["words_per_minute"],
+                "pause_count": report["pause_count"],
+                "pitch_range_semitones": report["pitch_range_semitones"],
+                "target": target_name,
+                "prompt": prompt_name,
+            }
+        )
+        st.success("Notes saved in this browser session. The audio itself was not saved.")
 
 
-def signal_panels(signal: np.ndarray, source: str) -> np.ndarray:
-    st.caption(f"Input: **{source}** · {len(signal) / SAMPLE_RATE:.2f} seconds · 16 kHz mono")
-    show_chart(waveform_figure(signal, SAMPLE_RATE, "Waveform"))
-    st.audio(signal, sample_rate=SAMPLE_RATE)
-    return mfcc(signal, SAMPLE_RATE)
+def render_compressor() -> None:
+    st.markdown('<div class="sono-section-label">Optional tool · no audio stored</div>', unsafe_allow_html=True)
+    st.header("Make a recording easier to hear")
+    st.write(
+        "A gentle soft-knee compressor can bring quieter parts closer to louder parts. "
+        "It does not remove room noise or restore already-clipped audio."
+    )
+    source = audio_controls("compressor")
+    if source is None:
+        st.info("Upload or record a take to create a processed listening copy.")
+        audio, sample_rate = np.zeros(1, dtype=np.float64), SAMPLE_RATE
+    else:
+        audio, sample_rate = source
+    settings1, settings2 = st.columns(2)
+    with settings1:
+        threshold = st.slider("Threshold", -48, -3, -24, 1, format="%d dBFS")
+        ratio = st.slider("Ratio", 1.0, 10.0, 3.0, 0.5, format="%.1f:1")
+        knee = st.slider("Soft knee", 0, 18, 6, 1, format="%d dB")
+    with settings2:
+        attack = st.slider("Attack", 1, 80, 10, 1, format="%d ms")
+        release = st.slider("Release", 20, 500, 120, 10, format="%d ms")
+        makeup = st.slider("Make-up gain", -6, 12, 0, 1, format="%d dB")
+    if st.button("Compress and preview", type="primary", disabled=source is None):
+        result = compress_audio(
+            audio,
+            sample_rate,
+            threshold_db=threshold,
+            ratio=ratio,
+            knee_db=knee,
+            attack_ms=attack,
+            release_ms=release,
+            makeup_db=makeup,
+        )
+        st.session_state["speakready_compressed"] = result.audio
+        st.session_state["speakready_compression_report"] = {
+            "input_peak": result.input_peak_dbfs,
+            "output_peak": result.output_peak_dbfs,
+            "mean_reduction": result.mean_reduction_db,
+            "gain_db": result.gain_db,
+            "sample_rate": sample_rate,
+            "input_digest": hashlib.sha256(audio.tobytes()).hexdigest(),
+        }
+    output = st.session_state.get("speakready_compressed")
+    report = st.session_state.get("speakready_compression_report")
+    current_digest = hashlib.sha256(audio.tobytes()).hexdigest() if source is not None else None
+    if report is not None and report.get("input_digest") != current_digest:
+        output = None
+        report = None
+    if output is None or report is None:
+        return
+    metrics = st.columns(3)
+    metrics[0].metric("Input peak", f"{report['input_peak']:.1f} dBFS")
+    metrics[1].metric("Output peak", f"{report['output_peak']:.1f} dBFS")
+    metrics[2].metric("Average gain reduction", f"{report['mean_reduction']:.1f} dB")
+    before, after = st.columns(2)
+    with before:
+        chart(wave_chart(audio, sample_rate, "Original take", "compress-before"), "compress-before")
+        st.audio(audio, sample_rate=sample_rate)
+    with after:
+        chart(wave_chart(output, sample_rate, "Compressed copy", "compress-after"), "compress-after")
+        st.audio(output, sample_rate=sample_rate)
+    figure = go.Figure(
+        go.Scatter(
+            x=np.arange(
+                0,
+                len(report["gain_db"]),
+                max(1, len(report["gain_db"]) // 6_000),
+            )
+            / sample_rate,
+            y=report["gain_db"][:: max(1, len(report["gain_db"]) // 6_000)],
+            mode="lines",
+            line={"color": "#cf8d48"},
+            name="Applied gain",
+        )
+    )
+    figure.update_layout(
+        title="Compressor gain over time",
+        xaxis_title="Time (seconds)",
+        yaxis_title="Gain (dB)",
+        height=260,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    chart(figure, "compress-gain")
+    buffer = io.BytesIO()
+    sf.write(buffer, output, int(report["sample_rate"]), format="WAV", subtype="PCM_16")
+    st.download_button(
+        "Download processed WAV",
+        data=buffer.getvalue(),
+        file_name="speakready-compressed.wav",
+        mime="audio/wav",
+    )
+    if report["output_peak"] > 0:
+        st.warning("The processed peak exceeds 0 dBFS; lower make-up gain to avoid clipping on export.")
+    st.caption("The compressor runs in memory. It is not a brick-wall limiter or a noise remover.")
 
 
-def render_home() -> None:
+def render_progress() -> None:
+    st.markdown('<div class="sono-section-label">Practice is personal</div>', unsafe_allow_html=True)
+    st.header("Your recent takes")
+    st.write("Compare your own sessions, using the same recording setup when possible.")
+    history = st.session_state.get("speakready_history", [])
+    if not history:
+        st.info("Save a practice note to start a private, session-only history.")
+        demo = st.toggle("Show a clearly illustrative example", key="show-example")
+        if demo:
+            example = pd.DataFrame(
+                {
+                    "Take": ["Reference take", "Practice 1", "Practice 2"],
+                    "Speaking pace (illustrative)": [172, 158, 146],
+                    "Pauses (illustrative)": [1, 2, 3],
+                }
+            )
+            st.caption("Illustration only—not recorded speech or measured user data.")
+            from plotly.subplots import make_subplots
+
+            figure = make_subplots(specs=[[{"secondary_y": True}]])
+            figure.add_trace(
+                go.Scatter(
+                    x=example["Take"],
+                    y=example["Speaking pace (illustrative)"],
+                    name="Speaking pace · wpm",
+                    mode="lines+markers",
+                    line={"color": "#167c80"},
+                ),
+                secondary_y=False,
+            )
+            figure.add_trace(
+                go.Scatter(
+                    x=example["Take"],
+                    y=example["Pauses (illustrative)"],
+                    name="Pause count",
+                    mode="lines+markers",
+                    line={"color": "#cf8d48"},
+                ),
+                secondary_y=True,
+            )
+            figure.update_layout(title="An illustrative reflection view", height=330)
+            figure.update_xaxes(title_text="Practice take")
+            figure.update_yaxes(title_text="Words per minute", secondary_y=False)
+            figure.update_yaxes(title_text="Pauses", secondary_y=True)
+            chart(figure, "sample-progress")
+            st.info("A useful practice goal is a clear idea and a comfortable breath—not a perfect chart.")
+        return
+    frame = pd.DataFrame(history)
+    frame["Take"] = np.arange(1, len(frame) + 1)
+    if frame["words_per_minute"].notna().any():
+        figure = px.line(
+            frame,
+            x="Take",
+            y="words_per_minute",
+            markers=True,
+            color_discrete_sequence=["#167c80"],
+            title="Your speaking pace across saved takes",
+        )
+        figure.update_yaxes(title="Words per minute · transcript-based")
+        chart(figure, "history-pace")
+    figure = px.bar(
+        frame,
+        x="Take",
+        y="pause_count",
+        color_discrete_sequence=["#cf8d48"],
+        title="Detected internal pauses",
+    )
+    chart(figure, "history-pauses")
+    st.dataframe(
+        frame.drop(columns=["Take"]),
+        hide_index=True,
+        width="stretch",
+    )
+    json_bytes = json.dumps(history, ensure_ascii=False, indent=2).encode("utf-8")
+    st.download_button(
+        "Export practice notes (JSON)",
+        json_bytes,
+        "speakready-practice-notes.json",
+        "application/json",
+    )
+    if st.button("Clear session history"):
+        st.session_state.pop("speakready_history", None)
+        st.rerun()
+    st.caption("History contains summary metrics only—not audio or the transcript. It lasts for this app session.")
+
+
+def render_about() -> None:
+    st.markdown('<div class="sono-section-label">Use the numbers kindly</div>', unsafe_allow_html=True)
+    st.header("What SpeakReady measures")
+    st.write(
+        "SpeakReady is for rehearsing everyday answers, talks and presentations. "
+        "It offers small, observable prompts so practice can feel more actionable."
+    )
+    with st.container(border=True):
+        left, right = st.columns(2)
+        with left:
+            st.subheader("What the feedback means")
+            st.markdown(
+                """
+                - **Speaking pace** uses your own transcript and detected active time.
+                - **Pauses** come from a simple frame-energy voice-activity heuristic.
+                - **Pitch contour** tracks periodicity in voiced frames only.
+                - **Loudness** uses the recording's digital level; microphones differ.
+                - **Compression** is an optional soft-knee, feed-forward dynamics tool.
+                """
+            )
+        with right:
+            st.subheader("What it does not mean")
+            st.markdown(
+                """
+                - It does not diagnose a speech, hearing or health condition.
+                - It does not measure confidence, intelligence, accent quality or suitability.
+                - It does not decide which pace, pitch or pauses are best for you.
+                - Transcript-based pace depends on transcript accuracy.
+                - The English-oriented pace examples are not universal language norms.
+                """
+            )
+    st.subheader("Privacy, plainly")
     st.markdown(
         """
-        <section class="sono-hero">
-          <div class="sono-kicker">THE INTERPRETABLE SPEECH LAB</div>
-          <h1>SONOSCOPE</h1>
-          <p>See speech as signal, features and decisions. Explore classical audio processing with every step visible.</p>
-          <div class="sono-hero-meta">
-            <span class="sono-chip">◉ CPU-ready</span>
-            <span class="sono-chip">16 kHz audio</span>
-            <span class="sono-chip">English · हिन्दी · ಕನ್ನಡ</span>
-            <span class="sono-chip">No librosa</span>
-          </div>
-        </section>
-        """,
-        unsafe_allow_html=True,
+        **Local run:** audio analysis happens in your Python process; recordings are processed in memory and not added to history.
+        **Hosted app:** audio is sent to Streamlit Community Cloud to run the app. Avoid uploading sensitive audio to the hosted service.
+        **History:** stores only summary numbers in the current Streamlit session. Exported JSON is an explicit download.
+        **Compressor:** creates a WAV download in memory; no server-side audio archive is created.
+        """
     )
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Methods", "MFCC · DTW · HMM")
-    c2.metric("Languages", "EN · HI · KN")
-    c3.metric("Runtime", "Local CPU · 16 kHz")
-    st.markdown(
-        '<div class="sono-section-label">Explore the lab</div>',
-        unsafe_allow_html=True,
-    )
-    left, right = st.columns([0.85, 1.4], gap="large")
-    with left:
-        st.subheader("Listen & inspect")
-        st.markdown(
-            '<div class="sono-small-note">A generated acoustic pattern demonstrates the feature and recognition pipeline. '
-            'It is intentionally synthetic—not spoken language.</div>',
-            unsafe_allow_html=True,
-        )
-        language_names = {"en": "English", "hi": "Hindi", "kn": "Kannada"}
-        selected_language = st.selectbox(
-            "Command language",
-            ["English", "Hindi", "Kannada"],
-            key="home-language",
-        )
-        language_code = {value: key for key, value in language_names.items()}[selected_language]
-        language_commands = [command for command in COMMANDS if command.language == language_code]
-        command = st.selectbox(
-            "Demo phrase",
-            language_commands,
-            format_func=lambda item: item.text,
-            key="home-command",
-        )
-        signal = synthesize_command(command)
-        features = mfcc(signal, SAMPLE_RATE)
-        model = demo_model()
-        scores = model.score(features)
-        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-        recognition = model.recognize(features)
-        c1, c2 = st.columns(2)
-        c1.metric("DTW match", "Exact" if recognition.label == command.key else "Review")
-        c2.metric("Frames", f"{len(features)}")
-        if st.button("Run demo recognition", type="primary"):
-            started = time.perf_counter()
-            result = model.recognize(features)
-            elapsed = (time.perf_counter() - started) * 1000
-            if result.label == command.key:
-                st.success(f"Matched **{command.text}** ({command.language.upper()})")
-            else:
-                st.warning(f"Model result: {result.label or 'rejected'}")
-            st.caption(f"DTW score {result.score:.3f} · {elapsed:.1f} ms on this process")
-        if ranked:
-            relative_scores = pd.DataFrame(
-                [
-                    {
-                        "Candidate": COMMAND_BY_KEY[key].text,
-                        "Relative DTW score": float(np.exp(np.clip(score - ranked[0][1], -20, 0))),
-                    }
-                    for key, score in ranked[:5]
-                ]
-            )
-            ranking_chart = px.bar(
-                relative_scores.sort_values("Relative DTW score"),
-                x="Relative DTW score",
-                y="Candidate",
-                orientation="h",
-                color="Relative DTW score",
-                color_continuous_scale=["#d9ece7", "#167c80"],
-                title="Nearest command templates",
-            )
-            ranking_chart.update_layout(
-                height=255,
-                margin={"l": 5, "r": 10, "t": 50, "b": 15},
-                coloraxis_showscale=False,
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-            )
-            show_chart(ranking_chart)
-    with right:
-        show_chart(demo_spectrogram_figure(signal, features))
-    with st.container(border=True):
-        lab1, lab2 = st.columns([1.1, 1])
-        with lab1:
-            st.markdown('<div class="sono-section-label">One signal, three views</div>', unsafe_allow_html=True)
-            st.subheader("From waveform to model")
-            st.markdown(
-                "The waveform is split into short, overlapping frames. A mel filterbank summarizes "
-                "spectral energy, and the discrete cosine transform gives a compact MFCC sequence."
-            )
-            st.markdown(
-                '<div class="sono-equation-card">Pre-emphasis &nbsp; <code>y[n] = x[n] − α x[n−1]</code></div>'
-                '<div class="sono-equation-card">MFCC &nbsp; <code>log mel energy → DCT → cepstral features</code></div>'
-                '<div class="sono-equation-card">DTW &nbsp; <code>minimum-cost monotonic frame alignment</code></div>',
-                unsafe_allow_html=True,
-            )
-        with lab2:
-            st.markdown('<div class="sono-section-label">Choose an experiment</div>', unsafe_allow_html=True)
-            st.markdown(
-                """
-                - **01 · Signal X-Ray** — waveform, spectrum and cepstral dynamics
-                - **02 · Vocal Tract** — LPC, pitch, formants and resynthesis
-                - **03 · Distance Lab** — DTW path and feature distances
-                - **04 · HMM Lab** — forward, backward and Viterbi
-                - **05 · Voice Assistant** — enroll, compare, confirm
-                """
-            )
-    st.warning(
-        "Research/demo tool, not an identity or safety system. Similarity scores are not calibrated probabilities; "
-        "always confirm actions and use consenting recordings."
-    )
+    st.subheader("The signal-processing idea")
+    st.latex(r"\mathrm{WPM}=\frac{\text{transcript word count}}{\text{detected speaking seconds}}\times60")
+    st.latex(r"g_{\mathrm{dB}}=L_{\mathrm{compressed}}-L_{\mathrm{input}}")
+    st.caption("Activity thresholds and pitch tracking are heuristics. Room noise and input levels can affect them.")
 
 
-def render_signal_xray() -> None:
-    st.header("Signal X-Ray")
-    st.write("Inspect the analysis chain from waveform to cepstral dynamics.")
-    signal, _, source = audio_input("xray")
-    features = signal_panels(signal, source)
-    show_chart(feature_heatmap(features, "MFCC"))
-    first_delta = delta(features)
-    second_delta = delta(first_delta)
-    a, b = st.columns(2)
-    with a:
-        show_chart(feature_heatmap(first_delta, "Delta MFCC"))
-    with b:
-        show_chart(feature_heatmap(second_delta, "Delta-delta MFCC"))
-    emphasized = pre_emphasis(signal)
-    frames = window_frames(frame_signal(emphasized, 400, 160))
-    if frames.size:
-        spectrum = np.abs(np.fft.rfft(frames, n=512, axis=1)) ** 2
-        bank = mel_filterbank(SAMPLE_RATE, 512, n_mels=26)
-        mel_energy = spectrum @ bank.T
-        col1, col2 = st.columns(2)
-        with col1:
-            show_chart(waveform_figure(emphasized, SAMPLE_RATE, "Pre-emphasized signal"))
-        with col2:
-            show_chart(feature_heatmap(np.log(np.maximum(mel_energy, 1e-12)), "Log mel-filterbank energy"))
-    with st.expander("What the transform does"):
-        st.markdown(
-            "Pre-emphasis boosts spectral tilt; overlapping Hamming frames approximate local stationarity. "
-            "The power spectrum is integrated by triangular mel filters, log-compressed, then decorrelated "
-            "with a DCT. Delta and delta-delta coefficients summarize local temporal change."
-        )
-        st.latex(r"c_m=\sum_{k=1}^{K}\log(E_k)\cos\left[\frac{\pi m}{K}(k-\frac12)\right]")
-
-
-def render_vocal_tract() -> None:
-    st.header("Vocal Tract Studio")
-    st.write("Estimate a source-filter model and inspect resonance and periodicity.")
-    signal, _, source = audio_input("vocal")
-    features = signal_panels(signal, source)
-    if len(signal) <= 16:
-        st.warning("Provide a longer clip to estimate LPC coefficients.")
-        return
-    order = st.slider("LPC order", min_value=8, max_value=24, value=16, step=2)
-    coefficients = lpc(signal[: min(len(signal), 4_000)], order)
-    pitch = estimate_pitch(signal, SAMPLE_RATE)
-    resonance = formants(signal[: min(len(signal), 4_000)], SAMPLE_RATE, order)
-    active = vad(signal)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Pitch estimate", f"{pitch:.1f} Hz" if pitch else "Unvoiced / unclear")
-    c2.metric("LPC order", str(order))
-    c3.metric("Active frames", f"{int(active.sum())} / {len(active)}")
-    st.write("Candidate formants (Hz):", ", ".join(f"{value:.0f}" for value in resonance[:5]) or "none detected")
-    a, b = st.columns(2)
-    with a:
-        show_chart(feature_heatmap(features, "MFCC context"))
-    with b:
-        if len(resonance) >= 2:
-            user_point = go.Scatter(x=[resonance[1]], y=[resonance[0]], mode="markers+text", text=["input"], name="Input")
-        else:
-            user_point = go.Scatter(x=[], y=[], mode="markers", name="Input")
-        reference = pd.DataFrame(
-            {"Vowel": ["i", "e", "a", "o", "u"], "F2 (Hz)": [2500, 2100, 1500, 1000, 800], "F1 (Hz)": [300, 500, 900, 600, 350]}
-        )
-        chart = px.scatter(reference, x="F2 (Hz)", y="F1 (Hz)", text="Vowel", title="Illustrative vowel space")
-        chart.add_trace(user_point)
-        chart.update_xaxes(autorange="reversed")
-        chart.update_yaxes(autorange="reversed")
-        show_chart(chart)
-    impulse = np.zeros(2_000)
-    impulse[:: max(1, int(SAMPLE_RATE / (pitch or 120.0)))] = 0.15
-    resynthesized = lpc_resynthesis(impulse, coefficients)
-    show_chart(waveform_figure(resynthesized, SAMPLE_RATE, "LPC source-filter resynthesis"))
-    st.caption("Formant points are rough resonances, not a validated phonetic classifier. Vowel references are illustrative.")
-
-
-def render_distance_lab() -> None:
-    st.header("Distance Lab")
-    st.write("Compare feature sequences and inspect the monotonic DTW alignment path.")
-    left, right = st.columns(2)
-    with left:
-        first = st.selectbox("Reference demo", COMMANDS, index=0, format_func=lambda item: f"{item.text} ({item.language})", key="dist-ref")
-    with right:
-        second = st.selectbox("Comparison demo", COMMANDS, index=1, format_func=lambda item: f"{item.text} ({item.language})", key="dist-cmp")
-    x = mfcc(synthesize_command(first), SAMPLE_RATE)
-    y = mfcc(synthesize_command(second), SAMPLE_RATE)
-    metric = st.selectbox("DTW local cost", ["euclidean", "cosine", "cepstral", "itakura"])
-    if metric == "itakura":
-        x_cost = spectral_frames(synthesize_command(first))
-        y_cost = spectral_frames(synthesize_command(second))
-    else:
-        x_cost, y_cost = x, y
-    cost, path = dtw(x_cost, y_cost, metric)
-    static = {
-        "Euclidean (mean MFCC)": euclidean_distance(x.mean(axis=0), y.mean(axis=0)),
-        "Cosine (mean MFCC)": cosine_distance(x.mean(axis=0), y.mean(axis=0)),
-        "Cepstral": cepstral_distance(x.mean(axis=0), y.mean(axis=0)),
-        "Itakura-Saito (mean power spectrum)": itakura_distance(spectral_frames(synthesize_command(first)).mean(axis=0), spectral_frames(synthesize_command(second)).mean(axis=0)),
-    }
-    a, b, c = st.columns(3)
-    a.metric("DTW normalized cost", f"{cost:.3f}")
-    b.metric("Alignment path length", str(len(path)))
-    selected_static_key = {
-        "euclidean": "Euclidean (mean MFCC)",
-        "cosine": "Cosine (mean MFCC)",
-        "cepstral": "Cepstral",
-        "itakura": "Itakura-Saito (mean power spectrum)",
-    }[metric]
-    c.metric("Selected static distance", f"{static[selected_static_key]:.3f}")
-    path_array = np.asarray(path)
-    figure = go.Figure(
-        go.Scatter(x=path_array[:, 1], y=path_array[:, 0], mode="lines", line={"color": "#1e6d74"})
-    )
-    figure.update_layout(title="DTW alignment path", xaxis_title="Comparison frame", yaxis_title="Reference frame", height=380)
-    show_chart(figure)
-    st.dataframe(pd.DataFrame({"Distance": list(static), "Value": list(static.values())}), hide_index=True, width="stretch")
-    st.caption("Lower is closer. Itakura-Saito is applied to non-negative power spectra; the other static comparisons use MFCCs.")
-
-
-def render_hmm_lab() -> None:
-    st.header("HMM Lab")
-    st.write("Explore the forward/backward recurrences, Viterbi decoding, and Baum-Welch updates.")
-    initial = np.array([0.6, 0.4])
-    transition = np.array([[0.7, 0.3], [0.2, 0.8]])
-    emission = np.array([[0.9, 0.1, 0.0], [0.05, 0.45, 0.5]])
-    observations = np.array([0, 1, 1, 2, 2, 1])
-    model = DiscreteHMM(initial, transition, emission)
-    forward_score, alpha = model.forward(observations)
-    backward_score, beta = model.backward(observations)
-    path_score, path = model.viterbi(observations)
-    a, b, c = st.columns(3)
-    a.metric("Forward log-likelihood", f"{forward_score:.3f}")
-    b.metric("Backward log-likelihood", f"{backward_score:.3f}")
-    c.metric("Viterbi log-probability", f"{path_score:.3f}")
-    col1, col2 = st.columns(2)
-    with col1:
-        show_chart(feature_heatmap(alpha, "Forward state posterior (scaled)"))
-        show_chart(feature_heatmap(beta, "Backward values (scaled)"))
-    with col2:
-        show_chart(feature_heatmap(transition, "Transition matrix A"))
-        show_chart(feature_heatmap(emission, "Emission matrix B"))
-    st.write("Observation symbols:", observations.tolist())
-    st.write("Most likely state path:", path.tolist())
-    if importlib.util.find_spec("hmmlearn") is None:
-        st.caption("Optional hmmlearn baseline is not installed; the displayed inference is the from-scratch implementation.")
-    else:
-        st.caption("hmmlearn is installed but unused here so the displayed inference remains fully inspectable.")
-    if st.button("Run Baum-Welch on a small demo corpus"):
-        trained = baum_welch(
-            [observations, np.array([0, 0, 1, 2, 2])],
-            n_states=2,
-            n_symbols=3,
-            iterations=15,
-            seed=7,
-        )
-        st.success(f"Trained model log-likelihood: {trained.score(observations):.3f}")
-        show_chart(feature_heatmap(trained.transition, "Learned transition matrix"))
-    with st.expander("Interpretation"):
-        st.markdown(
-            "Forward sums probabilities over all state paths; backward sums future observations. "
-            "Viterbi uses max-product decoding. Baum-Welch alternates expected state/transition counts "
-            "with normalized parameter updates. The implementation uses scaling/log likelihoods to control underflow."
-        )
-        st.latex(r"\alpha_t(j)=b_j(o_t)\sum_i \alpha_{t-1}(i)a_{ij}")
-
-
-def _session_profile() -> dict[str, list[np.ndarray]]:
-    profile = st.session_state.setdefault("enrollment", {})
-    return profile
-
-
-def _profile_json_shape(profile: dict[str, list[np.ndarray]]) -> dict[str, list[list[list[float]]]]:
-    return {
-        label: [sequence.tolist() for sequence in sequences]
-        for label, sequences in profile.items()
-    }
-
-
-def render_voice_assistant() -> None:
-    st.header("Voice Assistant")
-    st.write("Enroll short voice templates, compare with DTW and VQ-HMM, then confirm any proposed action.")
-    profile = _session_profile()
-    audio, _, source = audio_input("assistant")
-    features = mfcc(audio, SAMPLE_RATE)
-    if not len(features):
-        st.warning("No speech frames were produced for this input.")
-        return
-    st.caption(f"Input: {source} · {len(features)} MFCC frames")
-    enroll_tab, recognize_tab, todo_tab = st.tabs(["Enrollment & learning", "Recognition", "To-do actions"])
-    with enroll_tab:
-        language = st.selectbox("Enrollment language", ["English", "Hindi", "Kannada"])
-        label = st.text_input("Command phrase / label", placeholder="For example: add groceries")
-        if st.button("Enroll this voice sample", type="primary"):
-            if not label.strip():
-                st.error("Enter a phrase label before enrolling.")
-            else:
-                profile.setdefault(label.strip(), []).append(features.copy())
-                st.success(f"Added one sample to **{label.strip()}** ({language}).")
-        st.write(f"Enrolled labels: {len(profile)} · examples: {sum(map(len, profile.values()))}")
-        if profile:
-            st.dataframe(
-                pd.DataFrame([{"Command": name, "Samples": len(samples)} for name, samples in profile.items()]),
-                hide_index=True,
-                width="stretch",
-            )
-        export_data = export_profile(_profile_json_shape(profile))
-        st.download_button("Export voice profile ZIP", export_data, "sonoscope-profile.zip", "application/zip")
-        imported = st.file_uploader("Import profile ZIP", type=["zip"], key="profile-import")
-        if imported is not None and st.button("Validate and import profile"):
-            try:
-                restored = import_profile(imported.getvalue())
-            except ValueError as error:
-                st.error(str(error))
-            else:
-                for name, sequences in restored.items():
-                    profile.setdefault(name, []).extend(np.asarray(sequence, dtype=float) for sequence in sequences)
-                st.success(f"Imported {len(restored)} command labels into this session.")
-    with recognize_tab:
-        source_commands = profile if profile else {
-            command.key: [mfcc(synthesize_command(command), SAMPLE_RATE)] for command in COMMANDS
-        }
-        source_name = "your enrollment" if profile else "built-in synthetic examples"
-        st.caption(f"Models are trained from {source_name}. At least two distinct labels are needed for meaningful fusion.")
-        minimum_margin = st.slider("Minimum top-score margin for acceptance", 0.0, 2.0, 0.15, 0.05)
-        if st.button("Recognize with DTW + VQ-HMM", type="primary"):
-            if len(source_commands) < 2:
-                st.warning("Enroll at least two distinct command labels before recognition.")
-            else:
-                with st.spinner("Extracting features and scoring local models..."):
-                    dtw_model = DTWTemplateRecognizer().fit(source_commands)
-                    hmm_model = VQHMMRecognizer(
-                        codebook_size=8,
-                        n_states=3,
-                        iterations=8,
-                        seed=17,
-                    ).fit(source_commands)
-                    score_sets = {
-                        "dtw": dtw_model.score(features),
-                        "vq_hmm": hmm_model.score(features),
-                    }
-                    fused = fuse_scores(score_sets)
-                    result = recognize_with_fusion(score_sets, threshold=0.0)
-                ranked = sorted(fused.items(), key=lambda item: item[1], reverse=True)
-                margin = ranked[0][1] - ranked[1][1] if len(ranked) > 1 else 0.0
-                accepted = result.label is not None and not result.rejected and margin >= minimum_margin
-                st.session_state["last_recognition"] = {
-                    "label": result.label if accepted else None,
-                    "candidate": result.label,
-                    "features": features.copy(),
-                    "scores": fused,
-                    "margin": margin,
-                    "accepted": accepted,
-                }
-        last_result = st.session_state.get("last_recognition")
-        if last_result:
-            if not last_result["accepted"] or last_result["label"] is None:
-                st.warning("No command passed the confidence gate. Record again or add enrollment examples.")
-            else:
-                candidate = last_result["label"]
-                display_label = COMMAND_BY_KEY[candidate].text if candidate in COMMAND_BY_KEY else candidate
-                st.success(f"Candidate: **{display_label}** · normalized score margin {last_result['margin']:.2f}")
-                st.caption("Scores are relative z-normalized values, not calibrated probabilities.")
-                show_chart(px.bar(x=list(last_result["scores"]), y=list(last_result["scores"].values()), labels={"x": "Label", "y": "Fused score"}, title="Relative fused scores"))
-            if last_result["candidate"] is not None:
-                available = sorted(set(source_commands) | {last_result["candidate"]})
-                correction = st.selectbox("Correction-based learning: choose the correct label", available, key="correction")
-                if st.button("Save correction as a new enrollment example"):
-                    profile.setdefault(correction, []).append(last_result["features"])
-                    st.success(f"Added corrected example to **{correction}**.")
-        whisper_available = importlib.util.find_spec("whisper") is not None
-        if st.checkbox("Optional local Whisper tiny baseline"):
-            if not whisper_available:
-                st.info("Whisper is not installed. Core recognition remains fully local and available.")
-            else:
-                st.warning("Whisper may download its model on first use; continue only if that transfer is acceptable.")
-                if st.button("Transcribe locally with Whisper tiny"):
-                    import whisper
-
-                    model = whisper.load_model("tiny", device="cpu")
-                    transcription = model.transcribe(audio.astype(np.float32), fp16=False)
-                    st.write(transcription["text"])
-        if st.checkbox("Optional local text-to-speech preview (pyttsx3)"):
-            if importlib.util.find_spec("pyttsx3") is None:
-                st.info("pyttsx3 is not installed. Voice recognition and enrollment do not require it.")
-            else:
-                speech_text = st.text_input("Text to speak", value=label or "SONOSCOPE voice preview")
-                if st.button("Generate local TTS preview"):
-                    import pyttsx3
-
-                    with tempfile.TemporaryDirectory(prefix="sonoscope-") as directory:
-                        output_path = Path(directory) / "preview.wav"
-                        engine = pyttsx3.init()
-                        engine.save_to_file(speech_text, str(output_path))
-                        engine.runAndWait()
-                        st.audio(output_path.read_bytes(), format="audio/wav")
-    with todo_tab:
-        st.caption("Recognized commands only propose changes. Confirm explicitly before modifying this session's list.")
-        todos = st.session_state.setdefault("todos", [])
-        task_text = st.text_input("Task to add", placeholder="e.g., send the project draft")
-        last_result = st.session_state.get("last_recognition", {})
-        recognized = last_result.get("label")
-        intent = COMMAND_BY_KEY[recognized].intent if recognized in COMMAND_BY_KEY else ""
-        if recognized and recognized.lower().startswith(("add ", "add:", "todo_add")):
-            intent = "todo_add"
-        elif recognized and recognized.lower().startswith(("complete ", "done ", "todo_done")):
-            intent = "todo_done"
-        suggested = {"todo_add": "Add task", "todo_done": "Complete a task"}.get(intent)
-        if suggested:
-            st.info(f"Recognized command proposes: **{suggested}**. Confirm before applying.")
-        selected = st.selectbox("Action", ["Add task", "Complete a task"], index=0 if suggested != "Complete a task" else 1)
-        if selected == "Complete a task" and todos:
-            target = st.selectbox("Task", list(range(len(todos))), format_func=lambda i: todos[i]["text"])
-        else:
-            target = None
-        confirm = st.checkbox("I confirm this to-do change")
-        if st.button("Apply confirmed action", disabled=not confirm):
-            if selected == "Add task":
-                if not task_text.strip():
-                    st.error("Enter a task before adding it.")
-                else:
-                    todos.append({"text": task_text.strip(), "done": False})
-                    st.success("Task added to this session.")
-            elif target is None:
-                st.warning("There are no tasks to complete.")
-            else:
-                todos[target]["done"] = True
-                st.success("Task marked complete.")
-        if todos:
-            st.dataframe(pd.DataFrame(todos), hide_index=True, width="stretch")
-        else:
-            st.info("No tasks yet.")
-    st.caption("Local mode does not persist audio. Exported profiles contain MFCC voice features; treat them as sensitive.")
-
-
-def render_benchmark_ethics() -> None:
-    st.header("Benchmark & Ethics")
-    st.write("Run an explicitly synthetic sanity-check benchmark and inspect the privacy boundary.")
-    if st.button("Evaluate synthetic command set"):
-        matrix = np.zeros((len(COMMANDS), len(COMMANDS) + 1), dtype=int)
-        labels = [command.key for command in COMMANDS]
-        elapsed: list[float] = []
-        model = demo_model()
-        for index, command in enumerate(COMMANDS):
-            audio = synthesize_command(command)
-            started = time.perf_counter()
-            result = model.recognize(mfcc(audio, SAMPLE_RATE))
-            elapsed.append((time.perf_counter() - started) * 1000)
-            predicted_index = labels.index(result.label) if result.label in labels else len(COMMANDS)
-            matrix[index, predicted_index] += 1
-        accuracy = float(np.trace(matrix[:, :len(COMMANDS)]) / matrix.sum())
-        first, second = st.columns(2)
-        first.metric("Synthetic command accuracy", f"{accuracy:.0%}")
-        second.metric("Median latency", f"{np.median(elapsed):.1f} ms")
-        figure = px.imshow(matrix, x=labels + ["rejected"], y=labels, text_auto=True, color_continuous_scale="Tealgrn", title="Synthetic confusion matrix")
-        figure.update_layout(xaxis_title="Predicted label", yaxis_title="Reference label")
-        show_chart(figure)
-        rng = np.random.default_rng(2025)
-        noise_rows = []
-        for snr_db in (20, 10, 0):
-            correct = 0
-            for command in COMMANDS:
-                clean = synthesize_command(command)
-                power = np.sqrt(np.mean(clean**2))
-                noise = rng.normal(0.0, power / (10 ** (snr_db / 20)), clean.shape)
-                result = model.recognize(mfcc(clean + noise, SAMPLE_RATE))
-                correct += result.label == command.key
-            noise_rows.append({"Condition": f"{snr_db} dB SNR", "Accuracy": correct / len(COMMANDS)})
-        speaker_correct = 0
-        for command in COMMANDS:
-            clean = synthesize_command(command)
-            shifted = np.interp(
-                np.arange(0, len(clean), 1.04),
-                np.arange(len(clean)),
-                clean,
-            )
-            result = model.recognize(mfcc(shifted, SAMPLE_RATE))
-            speaker_correct += result.label == command.key
-        noise_rows.append({"Condition": "synthetic pitch/time shift", "Accuracy": speaker_correct / len(COMMANDS)})
-        show_chart(px.bar(pd.DataFrame(noise_rows), x="Condition", y="Accuracy", range_y=[0, 1], title="Synthetic noise / speaker-shift proxy"))
-        st.caption("Generated tone-pattern sanity checks only. Pitch/time shift is not a real cross-speaker evaluation.")
-    st.subheader("Robustness protocol")
-    st.markdown(
-        "- Measure accuracy and rejection by command, language, speaker, and recording condition.\n"
-        "- Evaluate noisy audio at stated SNRs and report latency on the target CPU.\n"
-        "- Keep speakers disjoint between enrollment and test sets; synthetic data cannot establish cross-speaker performance.\n"
-        "- Do not treat z-normalized recognition scores as probabilities."
-    )
-    st.subheader("Privacy and ethics")
-    st.markdown(
-        "Local processing is the default. Recordings are held only in the current request/session and are not written to disk. "
-        "A profile ZIP is a deliberate user export and includes voice-derived features. The optional Whisper baseline is a local "
-        "model when installed; first-time model retrieval may access the network. Voice similarity is not authentication."
-    )
-
-
-def render_pronunciation_coach() -> None:
-    st.header("Pronunciation Coach")
-    st.write("Compare a reference recording and an attempt using MFCC + DTW. This is a timing/similarity aid, not phonetic grading.")
-    a, b = st.columns(2)
-    with a:
-        reference_file = st.file_uploader("Reference WAV / FLAC / MP3", type=["wav", "flac", "mp3"], key="coach-ref")
-    with b:
-        attempt_file = st.file_uploader("Attempt WAV / FLAC / MP3", type=["wav", "flac", "mp3"], key="coach-attempt")
-    if reference_file is None or attempt_file is None:
-        st.info("Provide two clips to compare. Synthetic examples are intentionally not treated as spoken pronunciation.")
-        return
-    reference, _ = load_audio(reference_file.getvalue(), target_sr=SAMPLE_RATE)
-    attempt, _ = load_audio(attempt_file.getvalue(), target_sr=SAMPLE_RATE)
-    ref_features, attempt_features = mfcc(reference, SAMPLE_RATE), mfcc(attempt, SAMPLE_RATE)
-    score, path = dtw(ref_features, attempt_features, "euclidean")
-    x, y = st.columns(2)
-    with x:
-        show_chart(waveform_figure(reference, SAMPLE_RATE, "Reference waveform"))
-    with y:
-        show_chart(waveform_figure(attempt, SAMPLE_RATE, "Attempt waveform"))
-    st.metric("Length-normalized DTW feature cost", f"{score:.3f}")
-    path_data = np.asarray(path)
-    figure = go.Figure(go.Scatter(x=path_data[:, 1], y=path_data[:, 0], mode="lines"))
-    figure.update_layout(title="Frame alignment", xaxis_title="Attempt frame", yaxis_title="Reference frame", height=350)
-    show_chart(figure)
-    st.caption("A lower cost means closer MFCC sequences under this configuration; it does not identify mispronounced phonemes.")
-
-
-st.sidebar.markdown("## SONOSCOPE")
-st.sidebar.caption("Speech laboratory · 16 kHz · CPU")
-st.sidebar.markdown("**Privacy:** local processing; no audio uploads to a server in local mode.")
-tab_names = [
-    "Home",
-    "Signal X-Ray",
-    "Vocal Tract Studio",
-    "Distance Lab",
-    "HMM Lab",
-    "Voice Assistant",
-    "Benchmark & Ethics",
-    "Pronunciation Coach",
-]
-tabs = st.tabs(tab_names)
-renderers = [
-    render_home,
-    render_signal_xray,
-    render_vocal_tract,
-    render_distance_lab,
-    render_hmm_lab,
-    render_voice_assistant,
-    render_benchmark_ethics,
-    render_pronunciation_coach,
-]
-for tab, renderer in zip(tabs, renderers, strict=True):
-    with tab:
-        renderer()
+st.sidebar.markdown("## SpeakReady")
+st.sidebar.caption("Practice for what you want to say.")
+st.sidebar.markdown(
+    "**A gentle note:** this is a practice aid, not a clinical or identity tool."
+)
+st.title("SpeakReady")
+st.caption("A private-by-default speaking-practice coach · record a take, reflect, try again")
+practice_tab, progress_tab, compressor_tab, learn_tab = st.tabs(
+    ["Practice", "My progress", "Audio compressor", "How it works"]
+)
+with practice_tab:
+    render_practice()
+with progress_tab:
+    render_progress()
+with compressor_tab:
+    render_compressor()
+with learn_tab:
+    render_about()
