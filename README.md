@@ -109,3 +109,7 @@ SpeakReady is not a medical, therapeutic, hiring, assessment, identity, or emerg
 ## License
 
 No license is declared yet. Add a license before redistributing this repository.
+
+## Project title and brief description
+
+**SpeakReady - Speaking Practice Coach:** A privacy-minded web app for practicing interviews, presentations, meetings, and everyday conversations. It visualizes speech timing, pauses, and pitch, tracks session-only progress, and includes an audio compressor for listening copies.
