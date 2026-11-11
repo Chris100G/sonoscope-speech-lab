@@ -10,6 +10,8 @@ pinned: false
 
 # SONOSCOPE
 
+[**Launch the live SONOSCOPE app →**](https://sonoscope-speech-lab-gaz6gbduw9ge5xjiwac5tc.streamlit.app/) · [View source on GitHub](https://github.com/Chris100G/sonoscope-speech-lab)
+
 **A local-first speech laboratory and voice-command assistant** built with Streamlit, NumPy, and SciPy. SONOSCOPE demonstrates interpretable speech features and classical recognition methods without relying on librosa or a cloud transcription service.
 
 > **Academic/demo software:** Results depend on recording quality, speaker, and command vocabulary. This is not a production-grade or safety-critical assistant.
@@ -36,7 +38,7 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Open the local URL printed by Streamlit. Upload WAV/FLAC/MP3 audio or record through the browser microphone. In local mode, decoding and processing stay in the local app process; audio is not sent to an external service. Optional Whisper inference is local, though its model weights may be downloaded if they are not cached.
+Open the local URL printed by Streamlit. Upload WAV/FLAC/MP3 audio or record through the browser microphone. In local mode, decoding and processing stay in the local app process; audio is not sent to an external service. In the [hosted app](https://sonoscope-speech-lab-gaz6gbduw9ge5xjiwac5tc.streamlit.app/), audio is sent to Streamlit Community Cloud for processing. Optional Whisper inference is local, though its model weights may be downloaded if they are not cached.
 
 For development:
 
@@ -66,11 +68,13 @@ docs/
 
 ## Deployment
 
+- **Live app:** [sonoscope-speech-lab-gaz6gbduw9ge5xjiwac5tc.streamlit.app](https://sonoscope-speech-lab-gaz6gbduw9ge5xjiwac5tc.streamlit.app/)
+- **Source repository:** [github.com/Chris100G/sonoscope-speech-lab](https://github.com/Chris100G/sonoscope-speech-lab)
 - [Streamlit Community Cloud](DEPLOY.md#streamlit-community-cloud-primary)
 - [Hugging Face Spaces](DEPLOY.md#hugging-face-spaces-docker)
 - [Local Docker](DEPLOY.md#local-docker)
 
-Deployments must use the repository's lean `requirements.txt` and `packages.txt`. Streamlit Community Cloud has limited CPU/memory, so keep audio clips short and avoid loading large neural models. Community Cloud builds the app from a GitHub repository; deployment is not performed automatically by this project.
+The app is deployed on Streamlit Community Cloud from the public GitHub repository. Streamlit Community Cloud has limited CPU/memory, so keep audio clips short and avoid loading large neural models. New commits to `main` are deployed automatically.
 
 ## Privacy and limitations
 

@@ -2,11 +2,14 @@
 
 ## Streamlit Community Cloud (primary)
 
-1. Push this repository to a GitHub repository visible to your Streamlit account.
-2. In [Streamlit Community Cloud](https://share.streamlit.io/), create an app and select the repository, branch, and `app.py`.
-3. Keep the Python version at 3.11 where configurable. The repository includes a lean `requirements.txt`, Linux system package list (`packages.txt`), and `.streamlit/config.toml`.
-4. Deploy and inspect the app logs. Verify all eight navigation sections, upload handling, demo recognition, and profile import/export.
-5. No cloud API credentials are required. If enabling optional local Whisper, account for its first-use model download.
+The live app is [SONOSCOPE on Streamlit Community Cloud](https://sonoscope-speech-lab-gaz6gbduw9ge5xjiwac5tc.streamlit.app/), deployed from the public [GitHub repository](https://github.com/Chris100G/sonoscope-speech-lab), branch `main`, entrypoint `app.py`.
+
+To create another deployment or redeploy manually:
+
+1. In [Streamlit Community Cloud](https://share.streamlit.io/), select **Create app** and the repository, branch, and `app.py`.
+2. Keep the Python version at 3.11 where configurable. The repository includes a lean `requirements.txt`, Linux system package list (`packages.txt`), and `.streamlit/config.toml`.
+3. Deploy and inspect the app logs. Verify all eight navigation sections, upload handling, demo recognition, and profile import/export.
+4. No cloud API credentials are required. If enabling optional local Whisper, account for its first-use model download.
 
 Cloud instances are resource-constrained and ephemeral. The application must not depend on writable persistent storage: use in-memory state and temporary files that are cleaned up. Do not place uploads, recordings, or profile data in the repository or a shared persistent directory. The profile archive is an explicit user download/upload operation and can contain sensitive voice data.
 
@@ -38,4 +41,4 @@ Open <http://localhost:7860>. No audio is mounted into the container unless you 
 
 ## Deployment status
 
-This repository contains deployment configuration and instructions; it does not claim that a public deployment has been created. A live deployment requires a GitHub repository and an authorized hosting account.
+The public Community Cloud app is live at [sonoscope-speech-lab-gaz6gbduw9ge5xjiwac5tc.streamlit.app](https://sonoscope-speech-lab-gaz6gbduw9ge5xjiwac5tc.streamlit.app/). Its health endpoint has returned HTTP 200. The app source is in [Chris100G/sonoscope-speech-lab](https://github.com/Chris100G/sonoscope-speech-lab).
