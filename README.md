@@ -3,16 +3,16 @@ title: SpeakReady
 emoji: 🎙️
 colorFrom: teal
 colorTo: cyan
-sdk: docker
-app_port: 7860
+sdk: streamlit
+app_file: app.py
 pinned: false
 ---
 
 # SpeakReady
 
-[**Open the live practice coach →**](https://sonoscope-speech-lab-gaz6gbduw9ge5xjiwac5tc.streamlit.app/) · [Source on GitHub](https://github.com/Chris100G/sonoscope-speech-lab)
+**[Open the live practice coach →](https://sonoscope-speech-lab-gaz6gbduw9ge5xjiwac5tc.streamlit.app/) · [Source on GitHub](https://github.com/Chris100G/sonoscope-speech-lab)**
 
-**Make your next answer easier to deliver.** SpeakReady is a practical speaking-practice coach for interviews, meetings, class presentations and everyday conversations. Pick a realistic prompt, record a short take, see your speaking rhythm, and try one small change.
+**Make your next answer easier to deliver.** SpeakReady is a practical speaking-practice coach for interviews, meetings, class presentations and everyday conversations. Pick a realistic prompt, record a short take, see your speaking rhythm, pitch and pauses, and try one small change.
 
 > SpeakReady measures audio features. It does not measure confidence, diagnose a speech condition, or decide how anyone should sound.
 
@@ -21,27 +21,34 @@ pinned: false
 1. Open [SpeakReady](https://sonoscope-speech-lab-gaz6gbduw9ge5xjiwac5tc.streamlit.app/).
 2. In **Practice**, choose an interview, meeting, presentation or everyday prompt.
 3. Record your answer in the browser or upload WAV, FLAC or MP3.
-4. Optionally paste your own transcript to estimate words per minute. There is no required speech-to-text service.
-5. Choose a pace reference (or your own range), select **Review this take**, and explore the speaking/pause and pitch-contour charts.
-6. Save summary notes in the current session to compare takes. Audio and transcripts are not added to history.
-7. In **Audio compressor**, adjust threshold/ratio/attack/release, compare before and after, then download a WAV copy.
+4. Optionally trim the start and end of your take.
+5. Optionally paste your own transcript to estimate words per minute. There is no required speech-to-text service.
+6. Choose a pace reference (or your own range), select **Review this take**, and explore the speaking/pause and pitch-contour charts plus a pace gauge.
+7. Add a journal note and save the take to your private, session-only history to compare takes. Audio and transcripts are not added to history.
+8. In **Audio compressor**, adjust threshold/ratio/attack/release, compare before and after with a mix slider, then download a WAV copy.
+9. In **My progress**, view your pace and pause trends across saved takes, or enter comparison mode to compare two takes side by side.
+10. Use the sidebar to switch dark mode, export your session to JSON, import a previous session, or start a new session.
 
 **Illustrative sample:** the **My progress** tab can show a clearly marked example chart without uploading a recording. It is not speech or measured user data.
-
-## Why this helps in real life
-
-It turns “I should practise that answer” into a repeatable, private rehearsal loop: speak, notice one observable pattern, and try again. Rather than grading a speaker, SpeakReady shows practical signals such as a transcript-based pace estimate, detected pauses, voiced pitch contour, and recording level. A soft-knee compressor can make a practice copy easier to listen to.
 
 ## What it measures
 
 - **Speaking time and pauses:** energy-based voice-activity detection on 25 ms frames at 10 ms hops. Short gaps are joined; pauses are estimates, not word or breath boundaries.
 - **Speaking pace:** whitespace-delimited transcript words divided by detected speaking time. A user-provided transcript is optional and its accuracy affects the estimate.
-- **Pitch contour:** autocorrelation-based pitch estimates on a sparse sample of voiced frames. Background noise and pitch range can affect the result.
+- **Pitch contour:** autocorrelation-based pitch estimates on voiced frames, with a median line and optional pitch-range band.
 - **Recording level/clipping:** digital signal level, which changes with microphone, distance and device gain.
 - **Compressor:** RMS-envelope, feed-forward, soft-knee dynamics processing implemented in the project. It is not a brick-wall limiter or denoiser.
-- **Session history:** compares your saved take summaries; the optional example is explicitly illustrative.
+- **Session history:** compares your saved take summaries; the optional example is explicitly illustrative. Export to JSON to keep a copy.
 
 The pace ranges are editable practice references, not universal targets. Speech conventions vary across people, languages and contexts. Feedback is a suggestion, not a score.
+
+## Features
+
+- **Practice tab:** eight rehearsal prompts across interviews, meetings, presentations and everyday conversations; optional audio trimming; custom pace range; pace gauge; annotated rhythm timeline; pitch contour chart; journal notes; session-only history.
+- **My progress tab:** pace and pause trend lines across saved takes; comparison mode to overlay two takes; exportable session JSON; clear history.
+- **Audio compressor tab:** soft-knee compressor with threshold, ratio, knee, attack, release and make-up gain; before/after waveforms; mix slider; gain-over-time chart; WAV download.
+- **Appearance:** light and dark mode, responsive layout, metric cards, section badges.
+- **Privacy:** audio is processed in memory. Session history stores summary numbers only and lasts for the current browser session.
 
 ## Languages and accessibility
 
@@ -96,15 +103,16 @@ docker run --rm -p 7860:7860 speakready
 app.py                    Streamlit practice, progress, and compressor workflows
 sonoscope/coach/           Speech-practice metrics and compressor DSP
 sonoscope/dsp/             MFCC, LPC, DTW, VQ and discrete-HMM implementations
+sonoscope/ui/              Charts, session management, and styling
 sonoscope/recognizers/     DTW template and VQ-HMM recognizers
-tests/                     DSP, recognition, coach, and compressor tests
+tests/                     DSP, recognition, coach, compressor, and session tests
 scripts/smoke_test.py      Streamlit load and sample workflow check
 docs/                      Algorithms, ethics, and deployment notes
 ```
 
 ## Responsible use
 
-SpeakReady is not a medical, therapeutic, hiring, assessment, identity, or emergency system. It does not judge accents or prescribe a “correct” voice. Recording conditions strongly affect its estimates. See [docs/ETHICS.md](docs/ETHICS.md).
+SpeakReady is not a medical, therapeutic, hiring, assessment, identity, or emergency system. It does not judge accents or prescribe a "correct" voice. Recording conditions strongly affect its estimates. See [docs/ETHICS.md](docs/ETHICS.md).
 
 ## License
 
